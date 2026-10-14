@@ -1,0 +1,187 @@
+:root {
+    --lcd: #aab49f;
+    --lcd-deep: #89947f;
+    --ink: #17221a;
+    --ink-soft: rgba(23, 34, 26, .68);
+    --ink-faint: rgba(23, 34, 26, .34);
+    --alert: #651b19;
+    --screen-glow: rgba(177, 205, 151, .2);
+    --mono: "Lucida Console", "Courier New", ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; user-select: none; }
+button { font: inherit; -webkit-tap-highlight-color: transparent; }
+#app { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity .11s ease; }
+#app.visible { opacity: 1; }
+
+#beeper-shell {
+    position: absolute;
+    /* Anchored from the RIGHT edge, not the left. Pinning the left edge and
+       letting the shell grow rightwards is what pushed it off-screen: there is
+       no rule that 55vw + the shell's width fits in 100vw.
+
+       Size is min() with no px floor. The old clamp(520px, 43vw, 820px) had a
+       520px MINIMUM that outranked the vw term, so on a 1280-wide display the
+       shell was forced wider than the room left beside it and clipped by 38px.
+
+       The 72vh term is what keeps it on screen vertically: height is 0.805 x
+       width, so capping width against viewport height caps the height too.
+       Without it, aspect-ratio derives a height nothing is bounding. */
+    right: 4vw;
+    top: 38vh;
+    /* Declared once and reused for the font below, so text and device can never
+       be sized by different things. */
+    --shell-w: min(43vw, 72vh, 820px);
+    width: var(--shell-w);
+    /* The shell is the whole ARTWORK FILE, not just the device. The art carries
+       transparent margins, and object-fit: contain on a shell of matching
+       aspect maps the image 1:1 -- so every percentage below is a percentage of
+       the file and needs no crop maths. The margins are invisible; the only
+       cost is a slightly larger hit area than the pager itself. */
+    aspect-ratio: 1080 / 808;
+    transform-origin: 0 0;
+    pointer-events: auto;
+    filter: drop-shadow(0 18px 24px rgba(0,0,0,.42));
+}
+/* Dragging: the whole chassis is the handle, so the cursor advertises it.
+   The LCD keeps its own pointer because rows inside it are clickable. */
+/* Only the grip drags. The chassis as a whole used to be the handle, which
+   meant a press anywhere -- including over the buttons -- began a drag. The
+   grip is the bezel strip between the top of the casing and the top of the
+   LCD: above the screen, well clear of the button row. */
+#beeper-grip {
+    position: absolute;
+    left: 12%;
+    top: 8%;
+    width: 76%;
+    height: 22%;
+    z-index: 4;
+    cursor: grab;
+    /* Invisible, but a faint highlight on hover tells the player it is there. */
+    border-radius: 6% / 22%;
+    background: transparent;
+    transition: background .12s ease;
+}
+#beeper-grip:hover { background: rgba(255,255,255,.05); }
+#beeper-shell.dragging #beeper-grip { cursor: grabbing; background: rgba(255,255,255,.08); }
+#beeper-shell { cursor: default; }
+#beeper-screen { cursor: default; }
+
+#beeper-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+
+#beeper-screen {
+    position: absolute;
+    /* Measured from the artwork: the LCD occupies 704x154 px of the 1080x808
+       file. Re-measure and update these four numbers whenever the art changes
+       -- they are not decorative, they are where the readout physically is. */
+    left: 16.76%;
+    top: 31.81%;
+    width: 66.30%;
+    height: 21.04%;
+    overflow: hidden;
+    border-radius: 8.5% / 25%;
+    color: var(--ink);
+    background: linear-gradient(180deg, rgba(187,198,180,.96), rgba(157,170,150,.96));
+    box-shadow: inset 0 0 0 1px rgba(19,32,22,.45), inset 0 0 16px rgba(44,61,46,.18), 0 0 10px var(--screen-glow);
+    font-family: var(--mono);
+    /* Derived from the SHELL, not the viewport.
+       The old clamp(9px,.72vw,14px) tracked viewport width while the shell is
+       capped by height as well -- so on a short, wide display (1920x768) the
+       device shrank via the 72vh term while the text stayed at .72vw and no
+       longer fitted the LCD. Sizing both from --shell-w keeps the readout in
+       proportion at every resolution, which is the whole point of a device that
+       has to look real. The divisor preserves the original 820px/14px ratio. */
+    /* Floor lowered from 8px. The glass keeps shrinking with the device, so a
+       font that stops shrinking eventually cannot fit the rows it has to draw --
+       that floor was part of why the code list overlapped on smaller setups. */
+    font-size: clamp(6px, calc(var(--shell-w) / 58), 15px);
+    letter-spacing: .015em;
+}
+.lcd-scanline { position: absolute; inset: 0; pointer-events: none; opacity: .2; background: repeating-linear-gradient(180deg, transparent 0 2px, rgba(20,31,22,.08) 2px 3px); mix-blend-mode: multiply; }
+.lcd-header {
+    position: relative; z-index: 1;
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+    height: 22%; padding: 0 3.5%; border-bottom: 2px solid var(--ink);
+    font-weight: 900; text-transform: uppercase;
+}
+#lcd-signal { letter-spacing: -.16em; white-space: nowrap; }
+#lcd-brand { text-align: center; font-size: 1.08em; white-space: nowrap; }
+#lcd-battery { text-align: right; white-space: nowrap; }
+#lcd-battery.low { animation: lcdBlink .7s steps(1) infinite; }
+#lcd-content { position: relative; z-index: 1; height: 56%; overflow: hidden; padding: 2% 3.5% 1.5%; }
+#lcd-tabs { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(5, 1fr); align-items: stretch; height: 22%; border-top: 2px solid var(--ink); }
+#lcd-tabs button { min-width: 0; border: 0; border-right: 1px solid var(--ink-faint); color: var(--ink); background: transparent; padding: 0; cursor: pointer; font-weight: 900; font-size: .92em; line-height: 1; }
+#lcd-tabs button:last-child { border-right: 0; }
+#lcd-tabs button.active { color: var(--lcd); background: var(--ink); }
+
+.lcd-home { height: 100%; display: grid; grid-template-columns: 33% 1fr; gap: 3%; align-items: center; }
+.home-count { display: grid; place-items: center; border-right: 2px solid var(--ink); }
+.home-count strong { font-size: 2.5em; line-height: .9; letter-spacing: -.08em; }
+.home-count span { font-size: .65em; font-weight: 900; margin-top: .3em; }
+.home-copy { min-width: 0; display: grid; gap: .12em; }
+.home-copy strong { font-size: 1.1em; white-space: nowrap; overflow: hidden; }
+.home-copy span { font-size: .74em; font-weight: 800; white-space: nowrap; overflow: hidden; }
+.home-copy .priority { color: var(--alert); }
+
+/* A real pager LCD clips; it does not let one line bleed into the next.
+   Each row gets roughly a third of a ~130px glass, so a 1em code stacked over
+   a 0.68em meaning did not fit and spilled over the row below it. Tighter
+   leading plus overflow:hidden keeps the stack inside its row and truncates
+   rather than overlapping. */
+/* The list runs smaller than the rest of the readout on purpose. Each row is
+   about a third of a ~120px glass -- roughly 20px -- and it has to hold a code
+   line stacked over a meaning line. At the readout's base size those two came
+   to ~21px and overlapped. Dropping the list to .82em brings the pair to ~18px
+   and they fit with room to spare, at every device size, because the base font
+   is itself derived from the shell width. */
+.lcd-list { height: 100%; display: grid; grid-template-rows: repeat(3, 1fr); gap: 1px; font-size: .82em; }
+.lcd-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: .45em; min-height: 0; overflow: hidden; padding: 0 .35em; border-bottom: 1px dotted var(--ink-soft); cursor: pointer; font-weight: 800; }
+.lcd-row:last-child { border-bottom: 0; }
+.lcd-row.selected { color: var(--lcd); background: var(--ink); }
+.lcd-row .index { font-size: .7em; min-width: 1.7em; }
+.lcd-row .main { min-width: 0; white-space: nowrap; overflow: hidden; display: grid; align-content: center; line-height: .95; }
+.lcd-row .side { font-size: .7em; white-space: nowrap; }
+.lcd-row .sub { display: block; color: var(--ink-soft); font-size: .6em; line-height: .92; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lcd-row.selected .sub { color: var(--lcd); }
+.unread-dot { display: inline-block; width: .55em; height: .55em; border-radius: 50%; background: var(--ink); margin-right: .25em; }
+.lcd-row.selected .unread-dot { background: var(--lcd); }
+
+.lcd-detail { height: 100%; display: grid; grid-template-rows: auto 1fr auto; gap: .12em; }
+.detail-title { display: flex; justify-content: space-between; gap: .5em; font-weight: 900; white-space: nowrap; }
+.detail-body { min-height: 0; display: grid; align-content: center; gap: .08em; overflow: hidden; }
+.detail-body strong { font-size: 1.12em; white-space: nowrap; overflow: hidden; }
+.detail-body span { font-size: .7em; font-weight: 900; white-space: nowrap; overflow: hidden; }
+.detail-foot { display: grid; grid-template-columns: repeat(2,1fr); gap: .3em; font-size: .68em; font-weight: 900; }
+.detail-action { border: 1px solid var(--ink); color: var(--ink); background: transparent; text-align: center; padding: .08em .1em; cursor: pointer; font: inherit; font-weight: 900; line-height: 1; }
+.detail-action.selected { color: var(--lcd); background: var(--ink); }
+
+.identity { height: 100%; display: grid; align-content: center; gap: .12em; text-align: center; }
+.identity strong { font-size: 1.35em; letter-spacing: .03em; }
+.identity span { font-size: .7em; font-weight: 900; }
+
+.setting-list { height: 100%; display: grid; grid-template-rows: repeat(3, 1fr); gap: 2px; }
+.setting-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: .4em; padding: 0 .3em; border-bottom: 1px dotted var(--ink-soft); cursor: pointer; font-weight: 900; }
+.setting-row:last-child { border-bottom: 0; }
+.setting-row.selected { color: var(--lcd); background: var(--ink); }
+.setting-value { white-space: nowrap; }
+.lcd-empty { height: 100%; display: grid; place-items: center; text-align: center; font-size: .83em; font-weight: 900; line-height: 1.25; }
+
+.hardware { position: absolute; z-index: 10; border: 0; padding: 0; cursor: pointer; background: transparent; outline: none; }
+.hardware:focus-visible { outline: 2px dashed rgba(197,222,174,.8); }
+.hotspot-back { left: 15.4%; top: 63.7%; width: 15.0%; height: 10.7%; border-radius: 22%; }
+.hotspot-left { left: 33.2%; top: 63.6%; width: 15.0%; height: 10.7%; }
+.hotspot-right { left: 48.0%; top: 63.6%; width: 15.0%; height: 10.7%; }
+.hotspot-select { left: 67.0%; top: 63.5%; width: 15.2%; height: 10.8%; border-radius: 22%; }
+.hardware:hover { background: rgba(173,199,149,.045); box-shadow: inset 0 0 0 1px rgba(190,219,165,.18); }
+.close-button { position: absolute; z-index: 15; right: 4.4%; top: 18.8%; width: 4.2%; aspect-ratio: 1; display: grid; place-items: center; border: 1px solid rgba(190,219,165,.18); border-radius: 50%; color: rgba(209,230,193,.8); background: rgba(5,8,6,.62); cursor: pointer; opacity: .45; font: 900 12px/1 var(--mono); }
+.close-button:hover { opacity: 1; }
+
+#beeper-screen.alert-flash { animation: alertFlash .28s steps(1) 5; }
+#beeper-shell.vibrate { animation: pagerVibrate .12s linear 4; }
+@keyframes lcdBlink { 50% { opacity: .25; } }
+@keyframes alertFlash { 50% { filter: invert(1) contrast(1.25); } }
+@keyframes pagerVibrate { 25% { translate: -2px 0; } 75% { translate: 2px 0; } }
+/* No width override here any more -- min() above is already viewport-safe, and
+   a px floor is exactly what broke it. Short viewports only need the device
+   raised so the lower body is not crowded against the taskbar edge. */
+@media (max-height: 800px) { #beeper-shell { top: 30vh; } }
