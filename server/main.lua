@@ -1,0 +1,1674 @@
+local Bridge = RSPagerBridge
+local RESOURCE = GetCurrentResourceName()
+
+local Store = { version = 1, nextNumber = (Config.Numbering and Config.Numbering.Start) or 1000, devices = {} }
+local NumberIndex = {}
+local PlayerDevice = {}
+local DevicePlayer = {}
+local ManualGroups = {}
+local SignalState = {}
+local RateState = {}
+local ExternalRate = {}
+local RuntimeCodes = {}
+local RuntimeCodeOrder = {}
+local SaveScheduled = false
+local PageSequence = 0
+local CommEventOrigins = {}
+local BindingState = {}
+local BindingGeneration = {}
+local ProducerStats = {}
+
+local function dbg(...)
+    if Config.Debug then print(('[%s]'):format(RESOURCE), ...) end
+end
+
+local function nowMs()
+    return GetGameTimer()
+end
+
+local function clamp(value, minValue, maxValue)
+    value = tonumber(value) or minValue
+    if value < minValue then return minValue end
+    if value > maxValue then return maxValue end
+    return value
+end
+
+local function trim(value)
+    return tostring(value or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+
+local function cleanText(value, maxLen)
+    local text = trim(value):gsub('[\r\n\t]+', ' '):gsub('%s%s+', ' ')
+    maxLen = tonumber(maxLen) or 80
+    if #text > maxLen then text = text:sub(1, maxLen) end
+    return text
+end
+
+local function cleanCode(value)
+    local maxLen = (Config.Beeper and Config.Beeper.maxCodeLength) or 16
+    local code = tostring(value or ''):gsub('[^0-9%*#]', '')
+    if #code > maxLen then code = code:sub(1, maxLen) end
+    return code
+end
+
+local function canonicalNumber(value)
+    local digits = tostring(value or ''):gsub('%D', '')
+    return digits ~= '' and digits or nil
+end
+
+local function shallowCopy(source)
+    local out = {}
+    if type(source) == 'table' then
+        for k, v in pairs(source) do out[k] = v end
+    end
+    return out
+end
+
+local function bindingStateFor(src)
+    src = tonumber(src)
+    if not src then return nil end
+    local state = BindingState[src]
+    if not state then
+        state = {
+            attempts = 0,
+            reconciles = 0,
+            recoveries = 0,
+            bound = false
+        }
+        BindingState[src] = state
+    end
+    return state
+end
+
+local function clearPlayerBinding(src, reason)
+    src = tonumber(src)
+    if not src then return end
+    local deviceId = PlayerDevice[src]
+    if deviceId and DevicePlayer[deviceId] == src then DevicePlayer[deviceId] = nil end
+    PlayerDevice[src] = nil
+
+    local state = bindingStateFor(src)
+    if state then
+        state.bound = false
+        state.deviceId = nil
+        state.lastReason = reason or 'unbound'
+        state.lastUnboundAt = os.time()
+    end
+end
+
+local function noteProducer(resource, routeType)
+    resource = cleanText(resource or 'internal', 64)
+    if resource == '' then resource = 'internal' end
+    local stats = ProducerStats[resource]
+    if not stats then
+        stats = { calls = 0, firstSeenAt = os.time() }
+        ProducerStats[resource] = stats
+    end
+    stats.calls = stats.calls + 1
+    stats.lastSeenAt = os.time()
+    stats.lastRoute = cleanText(routeType or 'unknown', 24)
+end
+
+local function copyArray(source)
+    local out = {}
+    if type(source) == 'table' then
+        for i, v in ipairs(source) do out[i] = v end
+    end
+    return out
+end
+
+local function sanitizeMetadata(value)
+    if type(value) ~= 'table' then return nil end
+    local out, count = {}, 0
+    for key, item in pairs(value) do
+        if count >= 16 then break end
+        local keyText = cleanText(key, 32)
+        local itemType = type(item)
+        if keyText ~= '' and (itemType == 'string' or itemType == 'number' or itemType == 'boolean') then
+            if itemType == 'string' then item = cleanText(item, 128) end
+            out[keyText] = item
+            count = count + 1
+        end
+    end
+    return count > 0 and out or nil
+end
+
+local function defaultProfile()
+    return shallowCopy((Config.Profile and Config.Profile.Default) or {})
+end
+
+local function normalizeProfile(profile)
+    local defaults = defaultProfile()
+    profile = type(profile) == 'table' and profile or {}
+    for key, value in pairs(profile) do defaults[key] = value end
+    defaults.tone = cleanText(defaults.tone or 'classic', 16)
+    defaults.vibrate = defaults.vibrate ~= false
+    defaults.silent = defaults.silent == true
+    defaults.codeHints = defaults.codeHints == true
+    defaults.uiScale = math.floor(clamp(defaults.uiScale or 100, Config.Profile.ScaleMin or 75, Config.Profile.ScaleMax or 120))
+    defaults.uiX = clamp(defaults.uiX or 55, 0, 100)
+    defaults.uiY = clamp(defaults.uiY or 38, 0, 100)
+    return defaults
+end
+
+-- === persistence backend ===================================================
+--
+-- A pager number is the whole point of the device. It is printed on the ID
+-- page, it is what other players write down, and it is what every route
+-- eventually resolves to -- so losing it is not a cosmetic failure, it is the
+-- product failing.
+--
+-- The resource remains truly standalone: JSON is used when data/ is writable.
+-- Managed hosts commonly mount resources read-only, so the fallback is FiveM's
+-- built-in resource KVP store rather than an external SQL/database resource.
+local KVP_KEY = 'rs90:pagers:v1'
+local LEGACY_SQL_TABLE = 'rs_90sbeeper_store'
+local LEGACY_SQL_KEY = 'pagers'
+local storeMode = 'json'
+-- Set when the persisted store existed but could not be decoded. While true the
+-- resource REFUSES to save, so a corrupted-but-recoverable file is never
+-- overwritten by the empty store that replaced it in memory.
+local storeDamaged = false
+
+local function probeWritable()
+    local probe = 'data/.write_probe'
+    local token = ('probe-%d'):format(os.time())
+    local ok, wrote = pcall(SaveResourceFile, RESOURCE, probe, token, -1)
+    if not ok or wrote == false then return false end
+    local readback = LoadResourceFile(RESOURCE, probe)
+    pcall(SaveResourceFile, RESOURCE, probe, '', -1)
+    return readback == token
+end
+
+local function initializeStore()
+    if not (Config.Persistence and Config.Persistence.Enabled) then return end
+    if probeWritable() then
+        storeMode = 'json'
+        return
+    end
+
+    storeMode = 'kvp'
+    print('^2[rs-90sbeeper] data/ is read-only; persistence is using FiveM resource KVP. No database dependency is required.^7')
+end
+
+local function readLegacySqlStore()
+    if GetResourceState('oxmysql') ~= 'started' then return nil end
+    local raw
+    local ok = pcall(function()
+        raw = exports.oxmysql:scalar_async(
+            ('SELECT payload FROM %s WHERE store_key = ? LIMIT 1'):format(LEGACY_SQL_TABLE),
+            { LEGACY_SQL_KEY }
+        )
+    end)
+    if ok and type(raw) == 'string' and raw ~= '' then return raw end
+    return nil
+end
+
+local function readStoreRaw()
+    if storeMode == 'kvp' then
+        local raw
+        local ok = pcall(function() raw = GetResourceKvpString(KVP_KEY) end)
+        if ok and raw and raw ~= '' then return raw end
+
+        -- v0.4.2 could persist to oxmysql on read-only hosts. Import that store
+        -- once when oxmysql happens to be present, without making it a runtime
+        -- dependency or loading its library from the manifest.
+        local legacy = readLegacySqlStore()
+        if legacy then
+            pcall(function() SetResourceKvp(KVP_KEY, legacy) end)
+            print('^2[rs-90sbeeper] imported legacy oxmysql pager persistence into FiveM resource KVP.^7')
+            return legacy
+        end
+
+        -- First boot after upgrading from JSON: adopt the existing file if one
+        -- exists, then the next save writes the same store into KVP.
+    end
+    return LoadResourceFile(RESOURCE, Config.Persistence.File)
+end
+
+local function loadStore()
+    if not (Config.Persistence and Config.Persistence.Enabled) then return end
+    local raw = readStoreRaw()
+    if raw and raw ~= '' then
+        local ok, decoded = pcall(json.decode, raw)
+        if ok and type(decoded) == 'table' then
+            Store = decoded
+        else
+            -- Loud, repeated and unmissable. Silently continuing with an empty
+            -- store is how a server loses every pager number it ever issued:
+            -- the next save writes the blank store straight over the file.
+            storeDamaged = true
+            print('^1================================================================^7')
+            print('^1[rs-90sbeeper] PAGER STORE IS DAMAGED AND COULD NOT BE READ.^7')
+            print(('^1  source: %s^7'):format(storeMode == 'kvp' and 'resource KVP' or tostring(Config.Persistence.File)))
+            print('^1  SAVING IS NOW DISABLED so the damaged data is not overwritten.^7')
+            print('^3  Pagers still work this session, but nothing is persisted:^7')
+            print('^3  numbers, saved pages and settings will be LOST on restart,^7')
+            print('^3  and queued pages will not survive a reconnect.^7')
+            print('^3  TO FIX: move or delete the damaged store, then restart the^7')
+            print('^3  resource. Fresh pager numbers will be issued from scratch.^7')
+            print('^1================================================================^7')
+        end
+    end
+    Store.version = 1
+    Store.nextNumber = tonumber(Store.nextNumber) or (Config.Numbering.Start or 1000)
+    Store.devices = type(Store.devices) == 'table' and Store.devices or {}
+
+    NumberIndex = {}
+    for deviceId, record in pairs(Store.devices) do
+        record.deviceId = deviceId
+        record.messages = type(record.messages) == 'table' and record.messages or {}
+        record.profile = normalizeProfile(record.profile)
+        record.powered = record.powered ~= false
+        record.battery = clamp(record.battery or (Config.Battery.StartingLevel or 100), 0, 100)
+        -- Batteries refill on restart. This is deliberate while no beeperbattery
+        -- item exists in the live inventory: without it a drained pager is
+        -- permanently dead, because the only way to recharge needs an item the
+        -- server does not have. Set Config.Battery.RechargeOnRestart = false
+        -- once the item is installed and drain should actually persist.
+        if Config.Battery.Enabled and Config.Battery.RechargeOnRestart ~= false then
+            record.battery = clamp(Config.Battery.StartingLevel or 100, 0, 100)
+            record.powered = true
+        end
+        local numberKey = canonicalNumber(record.number)
+        if numberKey then NumberIndex[numberKey] = deviceId end
+    end
+end
+
+local function saveNow()
+    SaveScheduled = false
+    if not (Config.Persistence and Config.Persistence.Enabled) then return true end
+    if storeDamaged then
+        print('^1[rs-90sbeeper] save refused: the pager store is damaged. Move or delete it, then restart this resource.^7')
+        return false
+    end
+    local ok, encoded = pcall(json.encode, Store)
+    if not ok or type(encoded) ~= 'string' then
+        print(('^1[rs-90sbeeper] persistence encode failed: %s^7'):format(tostring(encoded)))
+        return false
+    end
+    if storeMode == 'kvp' then
+        local ok = pcall(function() SetResourceKvp(KVP_KEY, encoded) end)
+        if not ok then print('^1[rs-90sbeeper] KVP pager persistence write failed.^7') end
+        return ok
+    end
+
+    local saved = SaveResourceFile(RESOURCE, Config.Persistence.File, encoded, -1)
+    if saved == false then print('^1[rs-90sbeeper] persistence write failed.^7') end
+    return saved ~= false
+end
+
+local function scheduleSave()
+    if not (Config.Persistence and Config.Persistence.Enabled) or SaveScheduled then return end
+    SaveScheduled = true
+    SetTimeout((Config.Persistence and Config.Persistence.SaveDebounceMs) or 800, saveNow)
+end
+
+local function numberInUse(number)
+    return NumberIndex[canonicalNumber(number) or ''] ~= nil
+end
+
+local function allocateNumber()
+    local start = tonumber(Config.Numbering.Start) or 1000
+    local finish = tonumber(Config.Numbering.Finish) or 9999
+    local current = tonumber(Store.nextNumber) or start
+    local attempts = math.max(1, finish - start + 1)
+
+    for _ = 1, attempts do
+        if current > finish then current = start end
+        local display = string.format(Config.Numbering.Format or '555-%04d', current)
+        Store.nextNumber = current + 1
+        if not numberInUse(display) then return display end
+        current = current + 1
+    end
+    return nil
+end
+
+local function makeCapcode(deviceId)
+    local digits = math.max(4, math.min(9, tonumber(Config.Numbering.CapcodeDigits) or 7))
+    local modulus = 10 ^ digits
+    local value = (joaat(tostring(deviceId)) & 0x7fffffff) % modulus
+    return string.format('%0' .. tostring(digits) .. 'd', value)
+end
+
+local function getOrCreateDevice(deviceId, ownerIdentifier)
+    deviceId = tostring(deviceId)
+    local record = Store.devices[deviceId]
+    if not record then
+        local number = allocateNumber()
+        if not number then return nil, 'number_pool_exhausted' end
+        record = {
+            deviceId = deviceId,
+            number = number,
+            capcode = makeCapcode(deviceId),
+            ownerIdentifier = ownerIdentifier,
+            createdAt = os.time(),
+            powered = true,
+            battery = Config.Battery.StartingLevel or 100,
+            profile = defaultProfile(),
+            messages = {}
+        }
+        Store.devices[deviceId] = record
+        NumberIndex[canonicalNumber(number)] = deviceId
+        scheduleSave()
+    else
+        record.ownerIdentifier = ownerIdentifier or record.ownerIdentifier
+        record.profile = normalizeProfile(record.profile)
+        record.messages = type(record.messages) == 'table' and record.messages or {}
+    end
+    return record
+end
+
+local function bindPlayer(src)
+    src = tonumber(src)
+    local state = bindingStateFor(src)
+    if state then
+        state.attempts = state.attempts + 1
+        state.lastAttemptAt = os.time()
+        state.lastAttemptMs = nowMs()
+    end
+
+    if not src or not GetPlayerName(src) then
+        if state then state.lastReason = 'player_missing' end
+        clearPlayerBinding(src, 'player_missing')
+        return nil, 'player_missing'
+    end
+    local device = Bridge.GetPagerDevice(src)
+    if not device or not device.hasItem then
+        local reason = device and device.reason or 'no_item'
+        if state then state.lastReason = reason end
+        clearPlayerBinding(src, reason)
+        return nil, reason
+    end
+
+    local ownerIdentifier = Bridge.GetIdentifier(src)
+    local record, reason = getOrCreateDevice(device.id, ownerIdentifier)
+    if not record then
+        if state then state.lastReason = reason end
+        return nil, reason
+    end
+
+    local oldDevice = PlayerDevice[src]
+    if oldDevice and DevicePlayer[oldDevice] == src and oldDevice ~= device.id then DevicePlayer[oldDevice] = nil end
+    local deviceId = tostring(device.id)
+    local previousOwner = DevicePlayer[deviceId]
+    if previousOwner and previousOwner ~= src then
+        clearPlayerBinding(previousOwner, 'device_reassigned')
+    end
+    PlayerDevice[src] = deviceId
+    DevicePlayer[deviceId] = src
+
+    if state then
+        state.bound = true
+        state.deviceId = deviceId
+        state.lastReason = 'bound'
+        state.lastBoundAt = os.time()
+        state.lastVerifiedAt = os.time()
+        state.lastVerifiedMs = nowMs()
+    end
+    return record, nil, device
+end
+
+local function getSignal(src)
+    local state = SignalState[tonumber(src)] or {}
+    local bars = math.floor(clamp(state.bars or (Config.Signal.DefaultBars or 4), 0, 4))
+    local jammed = state.jammed == true
+    local available = state.available ~= false and not jammed
+    return {
+        available = available,
+        jammed = jammed,
+        bars = available and bars or 0,
+        reason = cleanText(state.reason or (jammed and 'JAMMED' or (available and 'SERVICE' or 'NO SERVICE')), 24)
+    }
+end
+
+local function canAlert(src, record)
+    if not src or not GetPlayerName(src) then return false end
+    if record.powered == false then return false end
+    if Config.Battery.Enabled and (tonumber(record.battery) or 0) <= 0 then return false end
+    if Config.Signal.Enabled and not getSignal(src).available then return false end
+    return true
+end
+
+local function unreadCount(record)
+    local count = 0
+    for _, message in ipairs(record.messages or {}) do
+        if message.read ~= true then count = count + 1 end
+    end
+    return count
+end
+
+local function lockedCount(record)
+    local count = 0
+    for _, message in ipairs(record.messages or {}) do
+        if message.locked == true then count = count + 1 end
+    end
+    return count
+end
+
+local function findMessage(record, id)
+    id = tostring(id or '')
+    for index, message in ipairs(record.messages or {}) do
+        if tostring(message.id) == id then return message, index end
+    end
+    return nil
+end
+
+local function initCodebook()
+    RuntimeCodes, RuntimeCodeOrder = {}, {}
+    if not (Config.Codebook and Config.Codebook.Enabled) then return end
+    for _, entry in ipairs(Config.Codebook.Entries or {}) do
+        local code = cleanCode(entry.code)
+        if code ~= '' then
+            local nextEntry = shallowCopy(entry)
+            nextEntry.code = code
+            nextEntry.meaning = cleanText(entry.meaning, 48)
+            nextEntry.category = cleanText(entry.category or 'GENERAL', 16):upper()
+            RuntimeCodes[code] = nextEntry
+            RuntimeCodeOrder[#RuntimeCodeOrder + 1] = code
+        end
+    end
+end
+
+local function hasManualGroup(src, group)
+    local set = ManualGroups[tonumber(src)]
+    return set and set[tostring(group)] == true or false
+end
+
+local function codeAllowed(src, entry)
+    if type(entry) ~= 'table' then return false end
+    if not entry.jobs and not entry.gangs and not entry.groups then return true end
+    local data = Bridge.GetPlayerData(src) or {}
+    if type(entry.jobs) == 'table' then
+        for _, name in ipairs(entry.jobs) do if tostring(name) == tostring(data.job) then return true end end
+    end
+    if type(entry.gangs) == 'table' then
+        for _, name in ipairs(entry.gangs) do if tostring(name) == tostring(data.gang) then return true end end
+    end
+    if type(entry.groups) == 'table' then
+        for _, name in ipairs(entry.groups) do if hasManualGroup(src, name) then return true end end
+    end
+    return false
+end
+
+local function codebookFor(src)
+    local list = {}
+    if not (Config.Codebook and Config.Codebook.Enabled and Config.Codebook.ShowInDevice) then return list end
+    for _, code in ipairs(RuntimeCodeOrder) do
+        local entry = RuntimeCodes[code]
+        if entry and codeAllowed(src, entry) then
+            list[#list + 1] = { code = code, meaning = entry.meaning, category = entry.category }
+        end
+    end
+    return list
+end
+
+local function decodeCodeFor(src, code)
+    code = cleanCode(code)
+    local entry = RuntimeCodes[code]
+    if entry and codeAllowed(src, entry) then
+        return { code = code, meaning = entry.meaning, category = entry.category, priority = entry.priority }
+    end
+    return nil
+end
+
+local function sortedMessages(src, record)
+    local out = {}
+    local revealCodes = (Config.Codebook and Config.Codebook.AutoShowMeaning == true) or record.profile.codeHints == true
+    for i = #record.messages, 1, -1 do
+        local message = record.messages[i]
+        local decoded = revealCodes and message.code and decodeCodeFor(src, message.code) or nil
+        out[#out + 1] = {
+            id = message.id,
+            sender = message.sender,
+            message = message.message,
+            code = message.code,
+            callback = message.callback,
+            instructions = message.instructions,
+            priority = message.priority,
+            createdAt = message.createdAt,
+            read = message.read == true,
+            locked = message.locked == true,
+            alerted = message.alerted == true,
+            codeMeaning = decoded and decoded.meaning or nil,
+            codeCategory = decoded and decoded.category or nil
+        }
+    end
+    return out
+end
+
+local function buildState(src, record)
+    local signal = getSignal(src)
+    return {
+        pager = {
+            number = record.number,
+            capcode = record.capcode,
+            network = Config.Beeper.networkLabel,
+            label = Config.Beeper.deviceLabel,
+            mode = Config.Beeper.mode,
+            memorySlots = Config.Beeper.memorySlots
+        },
+        messages = sortedMessages(src, record),
+        unread = unreadCount(record),
+        locked = lockedCount(record),
+        battery = math.floor((tonumber(record.battery) or 0) + 0.5),
+        batteryLow = (tonumber(record.battery) or 0) <= (Config.Battery.LowThreshold or 15),
+        powered = record.powered ~= false,
+        signal = signal,
+        profile = normalizeProfile(record.profile),
+        codebook = codebookFor(src),
+        codebookEnabled = Config.Codebook and Config.Codebook.Enabled == true,
+        codebookAutoHint = Config.Codebook and Config.Codebook.AutoShowMeaning == true,
+        serverTime = os.time()
+    }
+end
+
+local function pushState(src, record)
+    if not src or not record or not GetPlayerName(src) then return end
+    TriggerClientEvent('rs-90sbeeper:client:stateSync', src, buildState(src, record))
+end
+
+local function externalAllowed(invokingResource)
+    local resource = invokingResource or 'internal'
+    if resource == RESOURCE or resource == 'internal' then return true end
+    local limit = tonumber(Config.Security.MaxExternalPagesPerMinutePerResource) or 180
+    if limit <= 0 then return true end
+    local minute = math.floor(os.time() / 60)
+    local bucket = ExternalRate[resource]
+    if not bucket or bucket.minute ~= minute then
+        bucket = { minute = minute, count = 0 }
+        ExternalRate[resource] = bucket
+    end
+    bucket.count = bucket.count + 1
+    return bucket.count <= limit
+end
+
+local function sanitizePage(data, invokingResource)
+    data = type(data) == 'table' and data or {}
+    local maxBody = Config.Beeper.maxMessageLength or 80
+    local code = cleanCode(data.code)
+    local body = cleanText(data.message or data.body or data.text, maxBody)
+    local mode = string.lower(tostring(Config.Beeper.mode or 'mixed'))
+
+    if mode == 'numeric' then
+        local numericBody = cleanCode(body)
+        if code == '' then code = numericBody end
+        body = code
+    elseif body == '' and code ~= '' then
+        body = code
+    end
+
+    if code == '' then
+        local candidate = cleanCode(body)
+        if candidate == body and RuntimeCodes[candidate] then code = candidate end
+    end
+
+    if body == '' and code == '' then return nil, 'empty_page' end
+
+    local priority = string.lower(cleanText(data.priority or 'normal', 12))
+    if priority ~= 'normal' and priority ~= 'priority' and priority ~= 'emergency' then priority = 'normal' end
+    local known = code ~= '' and RuntimeCodes[code] or nil
+    if known and known.priority and priority == 'normal' then priority = known.priority end
+
+    PageSequence = (PageSequence + 1) % 100000
+    local page = {
+        id = ('PG-%d-%05d'):format(os.time(), PageSequence),
+        sender = cleanText(data.sender or data.from or 'UNKNOWN', Config.Beeper.maxSenderLength or 24),
+        message = body,
+        code = code ~= '' and code or nil,
+        callback = cleanText(data.callback or data.callbackNumber or '', Config.Beeper.maxCallbackLength or 24),
+        instructions = cleanText(data.instructions or '', 32),
+        priority = priority,
+        createdAt = os.time(),
+        read = false,
+        locked = false,
+        alerted = false,
+        sourceResource = invokingResource or RESOURCE,
+        metadata = sanitizeMetadata(data.metadata)
+    }
+    if page.callback == '' then page.callback = nil end
+    if page.instructions == '' then page.instructions = nil end
+    return page
+end
+
+local function insertMessage(record, page)
+    local maxMessages = math.max(1, tonumber(Config.Beeper.memorySlots) or 20)
+    if #record.messages >= maxMessages then
+        local removeAt
+        for index, existing in ipairs(record.messages) do
+            if existing.locked ~= true then removeAt = index break end
+        end
+        if not removeAt then return false, 'memory_full' end
+        table.remove(record.messages, removeAt)
+    end
+    record.messages[#record.messages + 1] = page
+    scheduleSave()
+    return true
+end
+
+local function pendingMessageExpired(message)
+    local metadata = type(message) == 'table' and message.metadata or nil
+    local expiresAt = metadata and tonumber(metadata.commExpiresAt) or nil
+    return expiresAt ~= nil and os.time() > expiresAt
+end
+
+local function alertMessage(src, record, message)
+    if pendingMessageExpired(message) then
+        message.alerted = true
+        scheduleSave()
+        return false
+    end
+    if not canAlert(src, record) then return false end
+    message.alerted = true
+    scheduleSave()
+    local payload = shallowCopy(message)
+    payload.sourceResource = nil
+    payload.metadata = nil
+    local revealCodes = (Config.Codebook and Config.Codebook.AutoShowMeaning == true) or record.profile.codeHints == true
+    local decoded = revealCodes and message.code and decodeCodeFor(src, message.code) or nil
+    payload.codeMeaning = decoded and decoded.meaning or nil
+    payload.codeCategory = decoded and decoded.category or nil
+    TriggerClientEvent('rs-90sbeeper:client:incoming', src, payload, {
+        unread = unreadCount(record),
+        battery = math.floor((tonumber(record.battery) or 0) + 0.5),
+        signal = getSignal(src),
+        profile = {
+            silent = record.profile.silent == true,
+            vibrate = record.profile.vibrate ~= false,
+            tone = record.profile.tone or 'classic'
+        }
+    })
+    return true
+end
+
+local function flushPendingAlerts(src, record)
+    if not canAlert(src, record) then return 0 end
+    local pending = {}
+    local droppedExpired = false
+    for index = #record.messages, 1, -1 do
+        local message = record.messages[index]
+        if message.alerted ~= true then
+            if pendingMessageExpired(message) then
+                table.remove(record.messages, index)
+                droppedExpired = true
+            else
+                table.insert(pending, 1, message)
+            end
+        end
+    end
+    if droppedExpired then scheduleSave() end
+    if #pending == 0 then return 0 end
+    for _, message in ipairs(pending) do message.alerted = true end
+    scheduleSave()
+    local latest = shallowCopy(pending[#pending])
+    latest.sourceResource = nil
+    latest.metadata = nil
+    local revealCodes = (Config.Codebook and Config.Codebook.AutoShowMeaning == true) or record.profile.codeHints == true
+    local decoded = revealCodes and latest.code and decodeCodeFor(src, latest.code) or nil
+    latest.codeMeaning = decoded and decoded.meaning or nil
+    latest.codeCategory = decoded and decoded.category or nil
+    TriggerClientEvent('rs-90sbeeper:client:pending', src, #pending, latest, {
+        unread = unreadCount(record),
+        signal = getSignal(src),
+        profile = {
+            silent = record.profile.silent == true,
+            vibrate = record.profile.vibrate ~= false,
+            tone = record.profile.tone or 'classic'
+        }
+    })
+    return #pending
+end
+
+local function bindAndFlush(src, cause)
+    src = tonumber(src)
+    if not src or not GetPlayerName(src) then return nil, 'player_missing' end
+    local before = PlayerDevice[src]
+    local record, reason, device = bindPlayer(src)
+    if not record then return nil, reason end
+
+    local deviceId = device and tostring(device.id) or PlayerDevice[src]
+    local changed = before ~= deviceId
+    if changed then
+        -- Never leave a previous character/device UI showing after a source has
+        -- switched identity. The next open receives the newly authoritative state.
+        if before then TriggerClientEvent('rs-90sbeeper:client:forceClose', src) end
+        flushPendingAlerts(src, record)
+    end
+
+    local state = bindingStateFor(src)
+    if state then
+        state.lastCause = cause or 'bind'
+        state.lastVerifiedAt = os.time()
+        state.lastVerifiedMs = nowMs()
+    end
+    return record, nil, device
+end
+
+local function reconcilePlayerBinding(src, cause)
+    src = tonumber(src)
+    if not src or not GetPlayerName(src) then return nil, 'player_missing' end
+    local state = bindingStateFor(src)
+    if state then state.reconciles = state.reconciles + 1 end
+
+    -- Resolve the current authoritative device WITHOUT creating a pager record.
+    -- If it still matches both sides of the live map, nothing else is needed.
+    local device = Bridge.GetPagerDevice(src)
+    if device and device.hasItem then
+        local deviceId = tostring(device.id)
+        if PlayerDevice[src] == deviceId and DevicePlayer[deviceId] == src then
+            if state then
+                state.bound = true
+                state.deviceId = deviceId
+                state.lastReason = 'verified'
+                state.lastCause = cause or 'reconcile'
+                state.lastVerifiedAt = os.time()
+                state.lastVerifiedMs = nowMs()
+            end
+            return Store.devices[deviceId], nil, device
+        end
+        return bindAndFlush(src, cause or 'reconcile')
+    end
+
+    local reason = device and device.reason or 'no_item'
+    local hadBinding = PlayerDevice[src] ~= nil
+    if hadBinding then
+        clearPlayerBinding(src, reason)
+        -- Item loss should close immediately. Framework/inventory-not-ready is
+        -- treated as transient and the fast/periodic passes will recover it.
+        if Config.RequirePagerItem and Config.CloseWhenItemMissing and reason == 'no_item' then
+            TriggerClientEvent('rs-90sbeeper:client:forceClose', src, 'no_item')
+        else
+            TriggerClientEvent('rs-90sbeeper:client:forceClose', src)
+        end
+    elseif state then
+        state.lastReason = reason
+        state.lastCause = cause or 'reconcile'
+        state.lastVerifiedAt = os.time()
+        state.lastVerifiedMs = nowMs()
+    end
+    return nil, reason, device
+end
+
+local function startBindingRetries(src, cause)
+    src = tonumber(src)
+    if not src then return end
+    BindingGeneration[src] = (BindingGeneration[src] or 0) + 1
+    local generation = BindingGeneration[src]
+
+    if Config.Binding and Config.Binding.Enabled == false then
+        -- Backward-compatible opt-out: keep the old one-shot behavior rather
+        -- than disabling automatic binding altogether.
+        SetTimeout(8000, function()
+            if BindingGeneration[src] == generation and GetPlayerName(src) then
+                bindAndFlush(src, cause or 'legacy_one_shot')
+            end
+        end)
+        return
+    end
+
+    local configured = Config.Binding and Config.Binding.FastRetryDelaysMs
+    local delays = type(configured) == 'table' and configured or { 500, 1000, 2000, 4000, 8000, 15000 }
+
+    CreateThread(function()
+        for _, rawDelay in ipairs(delays) do
+            Wait(math.max(0, math.floor(tonumber(rawDelay) or 0)))
+            if BindingGeneration[src] ~= generation or not GetPlayerName(src) then return end
+            local record = reconcilePlayerBinding(src, cause or 'fast_retry')
+            if record then return end
+        end
+    end)
+end
+
+local function recoverLiveOwner(deviceId)
+    if not (Config.Binding and Config.Binding.RecoverOnNumberPage ~= false) then return nil end
+    deviceId = tostring(deviceId)
+    for _, raw in ipairs(GetPlayers()) do
+        local src = tonumber(raw)
+        if src and GetPlayerName(src) then
+            local device = Bridge.GetPagerDevice(src)
+            if device and device.hasItem and tostring(device.id) == deviceId then
+                local state = bindingStateFor(src)
+                if state then state.recoveries = state.recoveries + 1 end
+                local record = bindAndFlush(src, 'number_recovery')
+                if record and DevicePlayer[deviceId] == src then return src end
+            end
+        end
+    end
+    return nil
+end
+
+local function liveOwnerForDevice(deviceId)
+    deviceId = tostring(deviceId)
+    local src = DevicePlayer[deviceId]
+    if src and GetPlayerName(src) then
+        local device = Bridge.GetPagerDevice(src)
+        if device and device.hasItem and tostring(device.id) == deviceId then
+            local state = bindingStateFor(src)
+            if state then
+                state.bound = true
+                state.deviceId = deviceId
+                state.lastReason = 'live_owner_verified'
+                state.lastVerifiedAt = os.time()
+                state.lastVerifiedMs = nowMs()
+            end
+            return src
+        end
+        clearPlayerBinding(src, device and device.reason or 'device_changed')
+    end
+
+    -- Critical direct-number repair: if the join bind happened before Qbox (or
+    -- another framework) had a selected character, recover the authoritative
+    -- live owner NOW rather than storing the page silently and waiting for the
+    -- player to open the pager later.
+    return recoverLiveOwner(deviceId)
+end
+
+local function deliverToDevice(deviceId, page)
+    local record = Store.devices[tostring(deviceId)]
+    if not record then return false, 'not_found' end
+    local copy = shallowCopy(page)
+    copy.metadata = page.metadata and shallowCopy(page.metadata) or nil
+    local ok, reason = insertMessage(record, copy)
+    if not ok then return false, reason end
+    local src = liveOwnerForDevice(deviceId)
+    if src then
+        local alerted = alertMessage(src, record, copy)
+        if not alerted and Config.Signal and Config.Signal.QueueWhenUnavailable == false then
+            copy.alerted = true
+            scheduleSave()
+        end
+    end
+    return true, nil, record.number
+end
+
+local function deliverToPlayer(src, page)
+    local record, reason = bindPlayer(src)
+    if not record then return false, reason end
+    local copy = shallowCopy(page)
+    copy.metadata = page.metadata and shallowCopy(page.metadata) or nil
+    local ok, insertReason = insertMessage(record, copy)
+    if not ok then return false, insertReason end
+    local alerted = alertMessage(src, record, copy)
+    if not alerted and Config.Signal and Config.Signal.QueueWhenUnavailable == false then
+        copy.alerted = true
+        scheduleSave()
+    end
+    return true, nil, record.number
+end
+
+local function uniquePlayers(list)
+    local seen, out = {}, {}
+    for _, src in ipairs(list or {}) do
+        src = tonumber(src)
+        if src and GetPlayerName(src) and not seen[src] then seen[src] = true out[#out + 1] = src end
+    end
+    return out
+end
+
+local function matchesAny(value, names)
+    value = tostring(value or '')
+    if type(names) == 'string' then return value == names end
+    for _, name in ipairs(names or {}) do if value == tostring(name) then return true end end
+    return false
+end
+
+local function onlineForRoute(route)
+    route = type(route) == 'table' and route or {}
+    local routeType = string.lower(tostring(route.type or 'player'))
+    local players = {}
+
+    if routeType == 'player' then
+        players[#players + 1] = tonumber(route.id or route.player or route.source)
+    elseif routeType == 'players' then
+        for _, src in ipairs(route.players or route.ids or {}) do players[#players + 1] = tonumber(src) end
+    elseif routeType == 'all' or routeType == 'broadcast' then
+        for _, raw in ipairs(GetPlayers()) do players[#players + 1] = tonumber(raw) end
+    elseif routeType == 'job' or routeType == 'jobs' or routeType == 'gang' or routeType == 'gangs' then
+        local names = route.names or route.jobs or route.gangs or route.name
+        for _, raw in ipairs(GetPlayers()) do
+            local src = tonumber(raw)
+            local data = Bridge.GetPlayerData(src)
+            if data then
+                local compare = (routeType == 'gang' or routeType == 'gangs') and data.gang or data.job
+                if matchesAny(compare, names) and (route.dutyOnly ~= true or data.onduty ~= false) then players[#players + 1] = src end
+            end
+        end
+    elseif routeType == 'group' or routeType == 'groups' then
+        local groups = route.names or route.groups or route.name
+        if type(groups) == 'string' then groups = { groups } end
+        for _, raw in ipairs(GetPlayers()) do
+            local src = tonumber(raw)
+            for _, group in ipairs(groups or {}) do
+                if hasManualGroup(src, group) then players[#players + 1] = src break end
+            end
+        end
+    elseif routeType == 'department' then
+        local department = Config.Departments and Config.Departments[tostring(route.name or route.department)]
+        if department then return onlineForRoute(department) end
+    end
+
+    return uniquePlayers(players)
+end
+
+local function sendPageRoute(route, pageData, invokingResource, options)
+    invokingResource = invokingResource or GetInvokingResource() or 'internal'
+    options = type(options) == 'table' and options or {}
+    route = type(route) == 'table' and route or { type = 'player', id = route }
+    local routeType = string.lower(tostring(route.type or 'player'))
+    noteProducer(invokingResource, routeType)
+    if not options.skipRateLimit and not externalAllowed(invokingResource) then return { ok = false, error = 'rate_limited' } end
+
+    local page, reason = sanitizePage(pageData, invokingResource)
+    if not page then return { ok = false, error = reason } end
+    local result = { ok = true, stored = 0, failed = 0, errors = {} }
+    local maxRoutes = tonumber(Config.Security.MaxRoutesPerPage) or 256
+
+    if routeType == 'number' then
+        local deviceId = NumberIndex[canonicalNumber(route.number or route.id) or '']
+        if not deviceId then return { ok = false, error = 'not_found', stored = 0, failed = 1 } end
+        local ok, error = deliverToDevice(deviceId, page)
+        if ok then result.stored = 1 else result.failed = 1 result.errors[error or 'failed'] = 1 end
+        return result
+    elseif routeType == 'numbers' then
+        local count = 0
+        local deliveredDevice = {}
+        for _, number in ipairs(route.numbers or {}) do
+            if count >= maxRoutes then break end
+            local deviceId = NumberIndex[canonicalNumber(number) or '']
+            if deviceId and not deliveredDevice[deviceId] then
+                deliveredDevice[deviceId] = true
+                count = count + 1
+                local ok, error = deliverToDevice(deviceId, page)
+                if ok then result.stored = result.stored + 1 else result.failed = result.failed + 1 result.errors[error or 'failed'] = (result.errors[error or 'failed'] or 0) + 1 end
+            else
+                result.failed = result.failed + 1
+                result.errors.not_found = (result.errors.not_found or 0) + 1
+            end
+        end
+        return result
+    end
+
+    local players = onlineForRoute(route)
+    if #players == 0 then return { ok = true, stored = 0, failed = 0, onlineRecipients = 0 } end
+    for index, src in ipairs(players) do
+        if index > maxRoutes then break end
+        local ok, error = deliverToPlayer(src, page)
+        if ok then result.stored = result.stored + 1 else result.failed = result.failed + 1 result.errors[error or 'failed'] = (result.errors[error or 'failed'] or 0) + 1 end
+    end
+    result.onlineRecipients = math.min(#players, maxRoutes)
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- SERVER EXPORTS: GENERIC INTEGRATION SURFACE
+-- ---------------------------------------------------------------------------
+local function normalizeExportRoute(route)
+    if type(route) == 'table' then return route end
+    if type(route) == 'number' and GetPlayerName(route) then return { type = 'player', id = route } end
+    return { type = 'number', number = route }
+end
+
+exports('SendPage', function(route, pageData)
+    return sendPageRoute(normalizeExportRoute(route), pageData, GetInvokingResource())
+end)
+
+exports('SendPageToPlayer', function(src, pageData)
+    return sendPageRoute({ type = 'player', id = src }, pageData, GetInvokingResource())
+end)
+
+exports('SendPageToNumber', function(number, pageData)
+    return sendPageRoute({ type = 'number', number = number }, pageData, GetInvokingResource())
+end)
+
+exports('SendPageToJob', function(job, pageData, dutyOnly)
+    return sendPageRoute({ type = 'job', name = job, dutyOnly = dutyOnly == true }, pageData, GetInvokingResource())
+end)
+
+exports('SendPageToGang', function(gang, pageData)
+    return sendPageRoute({ type = 'gang', name = gang }, pageData, GetInvokingResource())
+end)
+
+exports('SendPageToGroup', function(group, pageData)
+    return sendPageRoute({ type = 'group', name = group }, pageData, GetInvokingResource())
+end)
+
+exports('SendPageToDepartment', function(department, pageData)
+    return sendPageRoute({ type = 'department', name = department }, pageData, GetInvokingResource())
+end)
+
+exports('BroadcastPage', function(pageData)
+    return sendPageRoute({ type = 'all' }, pageData, GetInvokingResource())
+end)
+
+exports('SendCode', function(route, code, options)
+    options = type(options) == 'table' and shallowCopy(options) or {}
+    options.code = cleanCode(code)
+    if not options.message then options.message = options.code end
+    return sendPageRoute(normalizeExportRoute(route), options, GetInvokingResource())
+end)
+
+exports('GetCommunicationCapabilities', function()
+    return {
+        device = 'pager',
+        protocol = 'rs-comms',
+        protocolVersion = RSCommEvent and RSCommEvent.Version or 0,
+        standalone = true,
+        voice = false,
+        serverAuthoritative = true,
+        serverEvent = RSCommEvent and RSCommEvent.EVENT or 'rs-comms:dispatch',
+        offlineNumberDelivery = true,
+        routes = { 'player', 'players', 'number', 'numbers', 'job', 'jobs', 'gang', 'gangs', 'group', 'groups', 'department', 'all', 'broadcast' }
+    }
+end)
+
+exports('GetPagerNumber', function(src)
+    local record = bindPlayer(tonumber(src))
+    return record and record.number or nil
+end)
+
+exports('GetPagerIdentity', function(src)
+    local record, reason = bindPlayer(tonumber(src))
+    if not record then return nil, reason end
+    return { number = record.number, capcode = record.capcode, deviceId = record.deviceId }
+end)
+
+exports('FindPagerByNumber', function(number)
+    local deviceId = NumberIndex[canonicalNumber(number) or '']
+    if not deviceId then return nil end
+    local record = Store.devices[deviceId]
+    if not record then return nil end
+    return { number = record.number, capcode = record.capcode, online = liveOwnerForDevice(deviceId) ~= nil }
+end)
+
+exports('SetPlayerPagerGroup', function(src, group, enabled)
+    src, group = tonumber(src), cleanText(group, 32)
+    if not src or group == '' then return false end
+    ManualGroups[src] = ManualGroups[src] or {}
+    if enabled == false then ManualGroups[src][group] = nil else
+        local count = 0
+        for _ in pairs(ManualGroups[src]) do count = count + 1 end
+        if not ManualGroups[src][group] and count >= (Config.Security.MaxManualGroupsPerPlayer or 32) then return false end
+        ManualGroups[src][group] = true
+    end
+    local deviceId = PlayerDevice[src]
+    if deviceId and Store.devices[deviceId] then pushState(src, Store.devices[deviceId]) end
+    return true
+end)
+
+exports('ClearPlayerPagerGroups', function(src)
+    ManualGroups[tonumber(src)] = nil
+    return true
+end)
+
+exports('GetPlayerPagerGroups', function(src)
+    local list = {}
+    for group in pairs(ManualGroups[tonumber(src)] or {}) do list[#list + 1] = group end
+    table.sort(list)
+    return list
+end)
+
+exports('SetPlayerSignal', function(src, available, bars, reason)
+    src = tonumber(src)
+    if not src then return false end
+    local old = getSignal(src)
+    SignalState[src] = SignalState[src] or {}
+    SignalState[src].available = available ~= false
+    SignalState[src].bars = math.floor(clamp(bars or Config.Signal.DefaultBars or 4, 0, 4))
+    SignalState[src].reason = cleanText(reason or '', 24)
+    local current = getSignal(src)
+    TriggerClientEvent('rs-90sbeeper:client:signal', src, current)
+    local deviceId = PlayerDevice[src]
+    local record = deviceId and Store.devices[deviceId]
+    if record and not old.available and current.available then flushPendingAlerts(src, record) end
+    return true
+end)
+
+exports('SetPlayerJammed', function(src, jammed, reason)
+    src = tonumber(src)
+    if not src then return false end
+    local old = getSignal(src)
+    SignalState[src] = SignalState[src] or {}
+    SignalState[src].jammed = jammed == true
+    SignalState[src].reason = cleanText(reason or (jammed and 'JAMMED' or ''), 24)
+    local current = getSignal(src)
+    TriggerClientEvent('rs-90sbeeper:client:signal', src, current)
+    local deviceId = PlayerDevice[src]
+    local record = deviceId and Store.devices[deviceId]
+    if record and not old.available and current.available then flushPendingAlerts(src, record) end
+    return true
+end)
+
+exports('DecodePagerCode', function(src, code)
+    return decodeCodeFor(tonumber(src), code)
+end)
+
+exports('RegisterPagerCode', function(code, data)
+    code = cleanCode(code)
+    if code == '' or type(data) ~= 'table' then return false end
+    local entry = shallowCopy(data)
+    entry.code = code
+    entry.meaning = cleanText(data.meaning, 48)
+    entry.category = cleanText(data.category or 'CUSTOM', 16):upper()
+    if not RuntimeCodes[code] then RuntimeCodeOrder[#RuntimeCodeOrder + 1] = code end
+    RuntimeCodes[code] = entry
+    for src, deviceId in pairs(PlayerDevice) do if Store.devices[deviceId] then pushState(src, Store.devices[deviceId]) end end
+    return true
+end)
+
+exports('UnregisterPagerCode', function(code)
+    code = cleanCode(code)
+    if not RuntimeCodes[code] then return false end
+    RuntimeCodes[code] = nil
+    for i = #RuntimeCodeOrder, 1, -1 do if RuntimeCodeOrder[i] == code then table.remove(RuntimeCodeOrder, i) end end
+    return true
+end)
+
+exports('RechargeBeeper', function(src, amount)
+    src = tonumber(src)
+    local record = bindPlayer(src)
+    if not record then return false end
+    record.battery = clamp((tonumber(record.battery) or 0) + (tonumber(amount) or Config.Battery.RechargeAmount or 100), 0, 100)
+    scheduleSave()
+    TriggerClientEvent('rs-90sbeeper:client:battery', src, math.floor(record.battery + 0.5), true)
+    flushPendingAlerts(src, record)
+    return true
+end)
+
+-- Internal server event for resource-to-resource integration without allowing
+-- clients to directly forge pages. Use TriggerEvent, NOT TriggerServerEvent.
+AddEventHandler('rs-90sbeeper:server:sendPage', function(route, pageData, response)
+    local result = sendPageRoute(route, pageData, GetInvokingResource() or 'internal-event')
+    if type(response) == 'function' then response(result) end
+end)
+
+-- ---------------------------------------------------------------------------
+-- CLIENT REQUESTS / RPC
+-- ---------------------------------------------------------------------------
+local function limited(src, key, interval)
+    RateState[src] = RateState[src] or {}
+    local now = nowMs()
+    local previous = RateState[src][key] or 0
+    if now - previous < interval then return true end
+    RateState[src][key] = now
+    return false
+end
+
+RegisterNetEvent('rs-90sbeeper:server:requestOpen', function(requestSerial)
+    local src = source
+    requestSerial = math.floor(tonumber(requestSerial) or 0)
+    if requestSerial < 1 then return end
+    if limited(src, 'open', Config.Security.OpenCooldownMs or 300) then
+        TriggerClientEvent('rs-90sbeeper:client:denied', src, 'denied', requestSerial)
+        return
+    end
+    local record, reason = bindPlayer(src)
+    if not record then
+        TriggerClientEvent('rs-90sbeeper:client:denied', src, reason or 'denied', requestSerial)
+        return
+    end
+    TriggerClientEvent('rs-90sbeeper:client:open', src, buildState(src, record), requestSerial)
+    SetTimeout(250, function()
+        if GetPlayerName(src) then flushPendingAlerts(src, record) end
+    end)
+end)
+
+local function rpcResult(src, requestId, ok, data, errorCode)
+    TriggerClientEvent('rs-90sbeeper:client:rpcResult', src, tostring(requestId or ''), {
+        ok = ok == true,
+        data = data,
+        error = errorCode
+    })
+end
+
+RegisterNetEvent('rs-90sbeeper:server:rpc', function(requestId, action, payload)
+    local src = source
+    requestId = cleanText(requestId, 64)
+    action = cleanText(action, 48)
+    payload = type(payload) == 'table' and payload or {}
+    if requestId == '' or action == '' then return end
+    if limited(src, 'rpc', Config.Security.RpcMinIntervalMs or 100) then
+        rpcResult(src, requestId, false, nil, 'rate_limited')
+        return
+    end
+
+    local record, reason = bindPlayer(src)
+    if not record then rpcResult(src, requestId, false, nil, reason or 'denied') return end
+
+    if action == 'message.read' then
+        local message = findMessage(record, payload.id)
+        if not message then rpcResult(src, requestId, false, nil, 'not_found') return end
+        message.read = true
+        scheduleSave()
+        rpcResult(src, requestId, true, { unread = unreadCount(record), message = message })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'message.toggleLock' then
+        local message = findMessage(record, payload.id)
+        if not message then rpcResult(src, requestId, false, nil, 'not_found') return end
+        message.locked = not (message.locked == true)
+        scheduleSave()
+        rpcResult(src, requestId, true, { locked = message.locked })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'message.delete' then
+        local message, index = findMessage(record, payload.id)
+        if not message or not index then rpcResult(src, requestId, false, nil, 'not_found') return end
+        if message.locked == true then rpcResult(src, requestId, false, nil, 'locked') return end
+        table.remove(record.messages, index)
+        scheduleSave()
+        rpcResult(src, requestId, true, { unread = unreadCount(record) })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'message.clearRead' then
+        local removed = 0
+        for i = #record.messages, 1, -1 do
+            local message = record.messages[i]
+            if message.read == true and message.locked ~= true then table.remove(record.messages, i) removed = removed + 1 end
+        end
+        if removed > 0 then scheduleSave() end
+        rpcResult(src, requestId, true, { removed = removed })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'pager.power' then
+        local requested = payload.powered
+        if requested == nil then requested = not (record.powered ~= false) end
+        if requested == true and Config.Battery.Enabled and (tonumber(record.battery) or 0) <= 0 then
+            rpcResult(src, requestId, false, nil, 'battery_dead')
+            return
+        end
+        record.powered = requested == true
+        scheduleSave()
+        rpcResult(src, requestId, true, { powered = record.powered })
+        pushState(src, record)
+        if record.powered then flushPendingAlerts(src, record) end
+        return
+    end
+
+    if action == 'profile.update' then
+        local patch = type(payload.patch) == 'table' and payload.patch or payload
+        local profile = normalizeProfile(record.profile)
+        if patch.tone ~= nil then profile.tone = cleanText(patch.tone, 16) end
+        if patch.vibrate ~= nil then profile.vibrate = patch.vibrate == true end
+        if patch.silent ~= nil then profile.silent = patch.silent == true end
+        if patch.codeHints ~= nil then profile.codeHints = patch.codeHints == true end
+        if patch.uiScale ~= nil then profile.uiScale = math.floor(clamp(patch.uiScale, Config.Profile.ScaleMin or 75, Config.Profile.ScaleMax or 120)) end
+        if patch.uiX ~= nil then profile.uiX = clamp(patch.uiX, 0, 100) end
+        if patch.uiY ~= nil then profile.uiY = clamp(patch.uiY, 0, 100) end
+        record.profile = profile
+        scheduleSave()
+        rpcResult(src, requestId, true, { profile = profile })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'profile.reset' then
+        if limited(src, 'profile_reset', 3000) then
+            rpcResult(src, requestId, false, nil, 'rate_limited')
+            return
+        end
+        record.profile = defaultProfile()
+        scheduleSave()
+        rpcResult(src, requestId, true, { profile = record.profile })
+        pushState(src, record)
+        return
+    end
+
+    if action == 'code.lookup' then
+        rpcResult(src, requestId, true, { entry = decodeCodeFor(src, payload.code) })
+        return
+    end
+
+    rpcResult(src, requestId, false, nil, 'unknown_action')
+end)
+
+local function rechargeNeedsItem()
+    local setting = Config.Battery and Config.Battery.RequireRechargeItem
+    if setting == true then return true end
+    if setting == false then return false end
+    return Bridge.HasInventoryIntegration and Bridge.HasInventoryIntegration() or false
+end
+
+local function rechargePlayer(src, record)
+    if rechargeNeedsItem() then
+        local item = Bridge.RemoveFirstAvailableItem(src, Config.Battery.RechargeItems or {}, 1)
+        if not item then return false, 'no_battery_item' end
+    end
+    record.battery = clamp((tonumber(record.battery) or 0) + (Config.Battery.RechargeAmount or 100), 0, 100)
+    scheduleSave()
+    TriggerClientEvent('rs-90sbeeper:client:battery', src, math.floor(record.battery + 0.5), true)
+    pushState(src, record)
+    flushPendingAlerts(src, record)
+    return true
+end
+
+RegisterNetEvent('rs-90sbeeper:server:recharge', function()
+    local src = source
+    if limited(src, 'recharge', 750) then return end
+    local record, reason = bindPlayer(src)
+    if not record then TriggerClientEvent('rs-90sbeeper:client:denied', src, reason or 'denied') return end
+    local ok, rechargeReason = rechargePlayer(src, record)
+    if not ok then TriggerClientEvent('rs-90sbeeper:client:denied', src, rechargeReason or 'no_battery_item') end
+end)
+
+-- ---------------------------------------------------------------------------
+-- COMMANDS / DIAGNOSTICS
+-- ---------------------------------------------------------------------------
+RegisterCommand(Config.Commands.Reset or 'rs90beeperreset', function(src)
+    if src <= 0 then return end
+    if limited(src, 'reset_command', 3000) then return end
+    local record = bindPlayer(src)
+    if not record then return end
+    record.profile = defaultProfile()
+    scheduleSave()
+    pushState(src, record)
+    TriggerClientEvent('rs-90sbeeper:client:notice', src, 'profile_reset', 'success')
+end, false)
+
+RegisterCommand(Config.Commands.Recharge or 'rechargebeeper', function(src)
+    if src <= 0 then return end
+    TriggerEvent('rs-90sbeeper:server:rechargeCommand', src)
+end, false)
+
+AddEventHandler('rs-90sbeeper:server:rechargeCommand', function(src)
+    src = tonumber(src)
+    if not src or src <= 0 then return end
+    if limited(src, 'recharge_command', 750) then return end
+    local record = bindPlayer(src)
+    if not record then return end
+    local ok, rechargeReason = rechargePlayer(src, record)
+    if not ok then TriggerClientEvent('rs-90sbeeper:client:denied', src, rechargeReason or 'no_battery_item') end
+end)
+
+RegisterCommand(Config.Commands.Diagnostic or 'rs90beeperdiag', function(src)
+    if src <= 0 then return end
+    if limited(src, 'diagnostic_command', 1500) then return end
+    local bridge = Bridge.GetDiagnostics(src)
+    local record, reason = bindPlayer(src)
+    local binding = bindingStateFor(src) or {}
+    local groups = {}
+    for group in pairs(ManualGroups[src] or {}) do groups[#groups + 1] = group end
+    table.sort(groups)
+    local producers = {}
+    for resource, stats in pairs(ProducerStats) do
+        if resource ~= RESOURCE and resource ~= 'internal' then
+            producers[#producers + 1] = {
+                resource = resource,
+                calls = stats.calls or 0,
+                lastRoute = stats.lastRoute,
+                lastSeenAt = stats.lastSeenAt
+            }
+        end
+    end
+    table.sort(producers, function(a, b)
+        if a.calls == b.calls then return tostring(a.resource) < tostring(b.resource) end
+        return a.calls > b.calls
+    end)
+    while #producers > 8 do table.remove(producers) end
+    TriggerClientEvent('rs-90sbeeper:client:diagnostics', src, {
+        framework = bridge.framework,
+        inventory = bridge.inventory,
+        persistence = storeMode,
+        commProtocol = RSCommEvent and RSCommEvent.Version or 0,
+        commBus = RSCommEvent and RSCommEvent.EVENT or 'rs-comms:dispatch',
+        requireItem = bridge.requireItem,
+        device = bridge.device,
+        binding = {
+            bound = PlayerDevice[src] ~= nil and DevicePlayer[PlayerDevice[src]] == src,
+            deviceId = PlayerDevice[src],
+            attempts = binding.attempts or 0,
+            reconciles = binding.reconciles or 0,
+            recoveries = binding.recoveries or 0,
+            lastReason = binding.lastReason,
+            lastCause = binding.lastCause,
+            lastBoundAt = binding.lastBoundAt,
+            lastVerifiedAt = binding.lastVerifiedAt,
+            reconcileIntervalMs = math.max(1000, tonumber(Config.Binding and Config.Binding.ReconcileIntervalMs) or 5000)
+        },
+        producers = producers,
+        pager = record and {
+            number = record.number,
+            capcode = record.capcode,
+            powered = record.powered ~= false,
+            battery = math.floor((record.battery or 0) + 0.5),
+            messages = #record.messages,
+            unread = unreadCount(record),
+            locked = lockedCount(record),
+            signal = getSignal(src),
+            groups = groups
+        } or nil,
+        error = reason
+    })
+end, false)
+
+RegisterCommand(Config.Commands.TestPage or 'rs90pagertest', function(src, args)
+    if src <= 0 then return end
+    local code = cleanCode(args[1] or '143')
+    local entry = RuntimeCodes[code]
+    local text = code ~= '' and code or '143'
+    sendPageRoute({ type = 'player', id = src }, {
+        sender = 'TEST PAGE',
+        code = code,
+        message = text,
+        callback = '555-0199',
+        instructions = 'USE PAYPHONE',
+        priority = entry and entry.priority or 'normal'
+    }, RESOURCE)
+end, false)
+
+-- ---------------------------------------------------------------------------
+-- LIFECYCLE
+-- ---------------------------------------------------------------------------
+CreateThread(function()
+    -- Must run before loadStore: it decides which backend the load reads from.
+    initializeStore()
+    loadStore()
+    initCodebook()
+    Wait(500)
+    Bridge.RegisterUsableItems()
+    Bridge.ValidateConfiguredItems()
+
+    for _, raw in ipairs(GetPlayers()) do
+        local src = tonumber(raw)
+        if src then startBindingRetries(src, 'resource_start') end
+    end
+end)
+
+AddEventHandler('playerJoining', function()
+    local src = source
+    startBindingRetries(src, 'player_joining')
+end)
+
+CreateThread(function()
+    while true do
+        local interval = math.max(1000, tonumber(Config.Binding and Config.Binding.ReconcileIntervalMs) or tonumber(Config.ItemAuditInterval) or 5000)
+        Wait(interval)
+        if not Config.Binding or Config.Binding.Enabled ~= false then
+            for _, raw in ipairs(GetPlayers()) do
+                local src = tonumber(raw)
+                if src and GetPlayerName(src) then reconcilePlayerBinding(src, 'periodic') end
+            end
+        end
+    end
+end)
+
+CreateThread(function()
+    local tickMs = 60000
+    while true do
+        Wait(tickMs)
+        if Config.Battery.Enabled and (tonumber(Config.Battery.DrainPerHour) or 0) > 0 then
+            local drain = (tonumber(Config.Battery.DrainPerHour) or 0) / 60.0
+            for src, deviceId in pairs(PlayerDevice) do
+                local record = Store.devices[deviceId]
+                if record and record.powered ~= false and GetPlayerName(src) then
+                    local before = tonumber(record.battery) or 0
+                    record.battery = clamp(before - drain, 0, 100)
+                    if math.floor(before) ~= math.floor(record.battery) then
+                        TriggerClientEvent('rs-90sbeeper:client:battery', src, math.floor(record.battery + 0.5), false)
+                    end
+                    if before > 0 and record.battery <= 0 then
+                        TriggerClientEvent('rs-90sbeeper:client:notice', src, 'battery_dead', 'error')
+                    end
+                end
+            end
+            scheduleSave()
+        end
+    end
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    BindingGeneration[src] = (BindingGeneration[src] or 0) + 1
+    clearPlayerBinding(src, 'player_dropped')
+    -- Keep the generation counter across source reuse. If it were reset to nil,
+    -- a new player reusing the same numeric source could recreate generation 1
+    -- and accidentally satisfy an old delayed retry that also captured 1.
+    BindingState[src] = nil
+    ManualGroups[src], SignalState[src], RateState[src] = nil, nil, nil
+end)
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= RESOURCE then return end
+    saveNow()
+end)
+
+
+-- ---------------------------------------------------------------------------
+-- Communication events
+--
+-- Step 5. The same event a radio shouts and a tablet renders as a card arrives
+-- here and becomes a PAGE. The shape is shared; this section is only how a
+-- 1990s pager says it.
+--
+-- What a pager deliberately does NOT do with an event:
+--
+--   * It ignores destination.channels entirely. A pager has no channels. An
+--     event addressed only to radio channels simply is not for this device,
+--     and inventing a mapping would be the first step back towards the fork
+--     that thought it was a radio.
+--   * It drops metadata.acknowledgement. This device cannot answer, so
+--     rendering RESPOND as though it were a button would be a lie. The player
+--     answers on a payphone -- that is the whole point of the product.
+--   * It carries no coordinates. A pager prints a place name, not a GPS fix.
+--
+-- What it keeps is what a pager is good at: a short, loud interruption that
+-- sends the player somewhere else.
+--
+-- Subscribed with AddEventHandler, never RegisterNetEvent, so no client can
+-- forge a page.
+-- ---------------------------------------------------------------------------
+local COMM_PRIORITY = {
+    routine = 'normal',
+    priority = 'priority',
+    -- A pager has three levels, the event format has four. Urgent folds up into
+    -- priority rather than down into normal: over-signalling an urgent page is
+    -- recoverable, under-signalling it is not.
+    urgent = 'priority',
+    emergency = 'emergency',
+}
+
+--- Event -> page. Flattened to the pager's vocabulary, nothing more.
+local function renderForPager(event)
+    local message = event.message or {}
+    local source = event.source or {}
+    local meta = event.metadata or {}
+
+    -- Body order is the reading order on a small LCD: who, then what.
+    local parts = {}
+    if source.callsign then parts[#parts + 1] = source.callsign end
+    if message.title then parts[#parts + 1] = message.title end
+    if message.body then parts[#parts + 1] = message.body end
+
+    return {
+        code = meta.code,
+        message = table.concat(parts, ' '),
+        priority = COMM_PRIORITY[event.priority] or 'normal',
+        sender = source.department or source.callsign,
+        -- Callback/instructions survive the common event, but remain inert text.
+        -- The pager never starts a call or acknowledges a dispatch itself.
+        callback = meta.callback,
+        instructions = meta.instructions,
+        metadata = { commEventId = event.id, commEventType = event.type, commExpiresAt = event.expiresAt },
+    }
+end
+
+--- Resolve all common-event destinations into ONE deduplicated pager route.
+--- This prevents a unit explicitly named in destination.players and also
+--- matching destination.jobs/groups from receiving the same dispatch twice.
+local function pagerRoute(event)
+    local dest = event.destination or {}
+    if dest.broadcast then return { type = 'broadcast' } end
+
+    local seen, players = {}, {}
+    local function addRoute(route)
+        for _, src in ipairs(onlineForRoute(route)) do
+            if not seen[src] then
+                seen[src] = true
+                players[#players + 1] = src
+            end
+        end
+    end
+
+    if dest.players then addRoute({ type = 'players', players = dest.players }) end
+    if dest.jobs then addRoute({ type = 'jobs', names = dest.jobs, dutyOnly = dest.dutyOnly == true }) end
+    if dest.gangs then addRoute({ type = 'gangs', names = dest.gangs }) end
+    if dest.groups then addRoute({ type = 'groups', names = dest.groups }) end
+    for _, department in ipairs(dest.departments or {}) do
+        addRoute({ type = 'department', name = department })
+    end
+
+    if #players == 0 then return nil end
+    return { type = 'players', players = players }
+end
+
+local function handleCommEvent(raw)
+    if Config.CommEvents and Config.CommEvents.Enabled == false then return end
+
+    local event, reason = RSCommEvent.Normalize(raw)
+    if not event then
+        if Config.Debug then
+            print(('[rs-90sbeeper] communication event rejected: %s'):format(tostring(reason)))
+        end
+        return
+    end
+    if not RSCommEvent.TargetsDevice(event, 'pager') then return end
+    if RSCommEvent.Expired(event) then return end
+
+    local floor = (Config.CommEvents and Config.CommEvents.MinPriority) or 'routine'
+    if not RSCommEvent.AtLeast(event, floor) then return end
+
+    local route = pagerRoute(event)
+    if not route then return end -- channel-only or no online common-event recipients
+
+    -- Direct TriggerEvent calls retain their actual resource identity through
+    -- GetInvokingResource. DispatchCommEvent() uses this short-lived map because
+    -- the export re-emits from inside rs-90sbeeper and would otherwise look
+    -- internal. Either way, every external sender gets its OWN rate-limit bucket.
+    local origin = CommEventOrigins[event.id] or GetInvokingResource() or 'rs-comms'
+    local page = renderForPager(event)
+    sendPageRoute(route, page, origin)
+end
+
+-- Server-only on purpose. Cfx recommends AddEventHandler (not RegisterNetEvent)
+-- for same-context events so clients cannot invoke this citywide dispatch bus.
+AddEventHandler(RSCommEvent.EVENT, handleCommEvent)
+
+--- So another server resource can raise a common event without knowing which
+--- RS communication devices are installed. There is no dependency in either
+--- direction; the event is simply ignored when nobody is listening.
+exports('DispatchCommEvent', function(raw)
+    local event, reason = RSCommEvent.Normalize(raw)
+    if not event then return false, reason end
+    local origin = GetInvokingResource() or RESOURCE
+    CommEventOrigins[event.id] = origin
+    TriggerEvent(RSCommEvent.EVENT, event)
+    CommEventOrigins[event.id] = nil
+    return true, event
+end)

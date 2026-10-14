@@ -1,0 +1,21 @@
+RS 90S BEEPER — PROPRIETARY LICENSE
+Copyright (c) 2026 RealitySucksRP. All rights reserved.
+
+This resource is commercial software sold by RealitySucksRP.
+
+PERMITTED
+- Installing and running this resource on FiveM server(s) operated by the
+  purchasing community.
+- Modifying the configuration and code for use on those server(s).
+
+NOT PERMITTED
+- Reselling, redistributing, sublicensing, or sharing this resource or any
+  modified version of it, in whole or in part, in source or compiled form.
+- Uploading this resource to public or private resource collections, leak
+  sites, or code-sharing platforms.
+- Removing or altering this license or the RealitySucksRP branding for the
+  purpose of redistribution.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL REALITYSUCKSRP BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.

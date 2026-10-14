@@ -1,0 +1,279 @@
+local Bridge = RSPagerClientBridge
+
+local pagerOpen = false
+local currentState = nil
+local pendingRpc = {}
+local rpcCounter = 0
+local poseProp = nil
+local poseActive = false
+
+local function locale(key, ...)
+    local value = (Config.Locale and Config.Locale[key]) or key
+    if select('#', ...) > 0 then
+        local ok, formatted = pcall(string.format, value, ...)
+        if ok then return formatted end
+    end
+    return value
+end
+
+local function send(action, payload)
+    SendNUIMessage({ action = action, data = payload or {} })
+end
+
+local function setUiOwnership(active)
+    if LocalPlayer and LocalPlayer.state then
+        LocalPlayer.state:set('rsBeeperUiOpen', active == true, false)
+        LocalPlayer.state:set('rsUiOpen', active == true, false)
+    end
+end
+
+local function stopPose()
+    if poseProp and DoesEntityExist(poseProp) then DeleteEntity(poseProp) end
+    poseProp = nil
+    if poseActive then
+        local ped = PlayerPedId()
+        if ped and ped > 0 then ClearPedSecondaryTask(ped) end
+    end
+    poseActive = false
+end
+
+local function startPose()
+    stopPose()
+    local cfg = Config.Animation or {}
+    if not cfg.Enabled or not cfg.Dict or not cfg.Clip then return end
+    local ped = PlayerPedId()
+    if not ped or ped <= 0 or IsEntityDead(ped) then return end
+
+    RequestAnimDict(cfg.Dict)
+    local expires = GetGameTimer() + 2500
+    while not HasAnimDictLoaded(cfg.Dict) and GetGameTimer() < expires do Wait(0) end
+    if not HasAnimDictLoaded(cfg.Dict) then return end
+
+    TaskPlayAnim(ped, cfg.Dict, cfg.Clip, 3.0, 3.0, -1, cfg.Flag or 49, 0.0, false, false, false)
+    poseActive = true
+
+    if cfg.UseProp and cfg.PropModel then
+        local model = joaat(cfg.PropModel)
+        RequestModel(model)
+        expires = GetGameTimer() + 2500
+        while not HasModelLoaded(model) and GetGameTimer() < expires do Wait(0) end
+        if HasModelLoaded(model) then
+            local coords = GetEntityCoords(ped)
+            poseProp = CreateObject(model, coords.x, coords.y, coords.z, false, false, false)
+            if poseProp and DoesEntityExist(poseProp) then
+                local offset = cfg.PropOffset or vector3(0.0, 0.0, 0.0)
+                local rotation = cfg.PropRotation or vector3(0.0, 0.0, 0.0)
+                AttachEntityToEntity(poseProp, ped, GetPedBoneIndex(ped, cfg.PropBone or 60309),
+                    offset.x, offset.y, offset.z, rotation.x, rotation.y, rotation.z,
+                    true, true, false, true, 1, true)
+            end
+            SetModelAsNoLongerNeeded(model)
+        end
+    end
+end
+
+local function setFocus(active)
+    pagerOpen = active == true
+    setUiOwnership(pagerOpen)
+    SetNuiFocus(pagerOpen, pagerOpen)
+    if SetNuiFocusKeepInput then SetNuiFocusKeepInput(pagerOpen and Config.UI.KeepGameInput == true) end
+    send('visible', { visible = pagerOpen })
+    if pagerOpen then startPose() else stopPose() end
+end
+
+local function closeBeeper()
+    if not pagerOpen then
+        setUiOwnership(false)
+        stopPose()
+        return
+    end
+    setFocus(false)
+end
+
+local function openBeeper()
+    if pagerOpen then return end
+    TriggerServerEvent('rs-90sbeeper:server:requestOpen')
+end
+
+local function toggleBeeper()
+    if pagerOpen then closeBeeper() else openBeeper() end
+end
+
+exports('useBeeper', openBeeper)
+exports('OpenBeeper', openBeeper)
+exports('CloseBeeper', closeBeeper)
+exports('ToggleBeeper', toggleBeeper)
+exports('RechargeBeeper', function() TriggerServerEvent('rs-90sbeeper:server:recharge') end)
+
+RegisterNetEvent('rs-90sbeeper:client:use', openBeeper)
+RegisterNetEvent('rs-90sbeeper:client:recharge', function()
+    TriggerServerEvent('rs-90sbeeper:server:recharge')
+end)
+
+if Config.Keybind and Config.Keybind.Enabled then
+    RegisterCommand(Config.Keybind.Command, toggleBeeper, false)
+    RegisterKeyMapping(Config.Keybind.Command, Config.Keybind.Description or 'Open / close RS 90s Beeper', 'keyboard', Config.Keybind.Default or 'F10')
+end
+
+if Config.Commands and Config.Commands.Open then
+    RegisterCommand(Config.Commands.Open, toggleBeeper, false)
+end
+
+RegisterNetEvent('rs-90sbeeper:client:open', function(state)
+    currentState = type(state) == 'table' and state or {}
+    send('state', currentState)
+    setFocus(true)
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:stateSync', function(state)
+    currentState = type(state) == 'table' and state or currentState
+    send('state', currentState or {})
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:incoming', function(message, summary)
+    summary = type(summary) == 'table' and summary or {}
+    if currentState then
+        currentState.unread = summary.unread or currentState.unread
+        currentState.battery = summary.battery or currentState.battery
+        currentState.signal = summary.signal or currentState.signal
+    end
+    send('incoming', { message = message or {}, summary = summary })
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:pending', function(count, latest, summary)
+    summary = type(summary) == 'table' and summary or {}
+    if currentState then
+        currentState.unread = summary.unread or currentState.unread
+        currentState.signal = summary.signal or currentState.signal
+    end
+    send('pending', { count = tonumber(count) or 0, message = latest or {}, summary = summary })
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:signal', function(signal)
+    if currentState then currentState.signal = signal end
+    send('signal', signal or {})
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:battery', function(level, recharged)
+    if currentState then currentState.battery = tonumber(level) or currentState.battery end
+    send('battery', { battery = tonumber(level) or 0, recharged = recharged == true })
+    if recharged then Bridge.Notify(locale('recharged', tonumber(level) or 0), 'success') end
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:notice', function(key, kind)
+    Bridge.Notify(locale(key), kind or 'inform')
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:denied', function(reason)
+    local key = tostring(reason or 'denied')
+    if key == 'no_battery_item' then
+        Bridge.Notify('You need a beeper battery.', 'error')
+    else
+        Bridge.Notify(locale(key), 'error')
+    end
+    send('denied', { reason = key })
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:forceClose', function(reason)
+    closeBeeper()
+    if reason then Bridge.Notify(locale(reason), 'error') end
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:diagnostics', function(data)
+    data = type(data) == 'table' and data or {}
+    local pager = data.pager or {}
+    local signal = pager.signal or {}
+    local text = table.concat({
+        ('Framework: %s'):format(tostring(data.framework or 'unknown')),
+        ('Inventory: %s'):format(tostring(data.inventory or 'unknown')),
+        ('Pager: %s'):format(tostring(pager.number or data.error or 'unavailable')),
+        ('Capcode: %s'):format(tostring(pager.capcode or '-')),
+        ('Power: %s'):format(pager.powered == false and 'OFF' or 'ON'),
+        ('Battery: %s%%'):format(tostring(pager.battery or '-')),
+        ('Signal: %s/4 %s'):format(tostring(signal.bars or 0), tostring(signal.reason or '')),
+        ('Inbox: %s (%s unread / %s locked)'):format(tostring(pager.messages or 0), tostring(pager.unread or 0), tostring(pager.locked or 0)),
+        ('Groups: %s'):format(#(pager.groups or {}) > 0 and table.concat(pager.groups, ',') or 'none')
+    }, ' | ')
+    Bridge.Notify(text, data.pager and 'success' or 'error')
+end)
+
+RegisterNetEvent('rs-90sbeeper:client:rpcResult', function(requestId, response)
+    local pending = pendingRpc[tostring(requestId or '')]
+    if not pending then return end
+    pendingRpc[tostring(requestId)] = nil
+    pending.cb(type(response) == 'table' and response or { ok = false, error = 'invalid_response' })
+end)
+
+local function nextRequestId()
+    rpcCounter = (rpcCounter + 1) % 1000000
+    return ('%d-%d'):format(GetGameTimer(), rpcCounter)
+end
+
+RegisterNUICallback('rpc', function(request, cb)
+    request = type(request) == 'table' and request or {}
+    local action = tostring(request.action or '')
+    local requestId = tostring(request.requestId or nextRequestId())
+    local payload = type(request.payload) == 'table' and request.payload or {}
+
+    if action == '' then cb({ ok = false, error = 'missing_action' }) return end
+
+    if action == 'ui.close' then
+        closeBeeper()
+        cb({ ok = true })
+        return
+    end
+
+    if action == 'ui.move' then
+        cb({ ok = true })
+        return
+    end
+
+    pendingRpc[requestId] = { cb = cb, expires = GetGameTimer() + 8000 }
+    TriggerServerEvent('rs-90sbeeper:server:rpc', requestId, action, payload)
+end)
+
+CreateThread(function()
+    while true do
+        Wait(250)
+        local now = GetGameTimer()
+        for requestId, pending in pairs(pendingRpc) do
+            if now >= pending.expires then
+                pendingRpc[requestId] = nil
+                pending.cb({ ok = false, error = 'timeout' })
+            end
+        end
+    end
+end)
+
+CreateThread(function()
+    while true do
+        if pagerOpen then
+            Wait(0)
+            local ped = PlayerPedId()
+            if not ped or ped <= 0 or IsEntityDead(ped) then
+                closeBeeper()
+            elseif Config.UI.KeepGameInput then
+                DisableControlAction(0, 24, true) -- attack
+                DisableControlAction(0, 25, true) -- aim
+                DisableControlAction(0, 37, true) -- weapon wheel
+                DisableControlAction(0, 200, true) -- pause / escape consumed by NUI
+            end
+        else
+            Wait(300)
+        end
+    end
+end)
+
+AddEventHandler('onClientResourceStart', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+    setUiOwnership(false)
+    send('visible', { visible = false })
+end)
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+    SetNuiFocus(false, false)
+    if SetNuiFocusKeepInput then SetNuiFocusKeepInput(false) end
+    setUiOwnership(false)
+    stopPose()
+end)

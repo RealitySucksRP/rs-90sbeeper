@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RS 90s Beeper</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <main id="app" aria-hidden="true">
+        <section id="beeper-shell" aria-label="RS 90s Beeper">
+            <img id="beeper-art" src="img/beeper.png" alt="" draggable="false" />
+
+            <!-- Drag handle: the bezel strip directly above the LCD. Kept as a
+                 real element rather than a hit-test in script so it carries its
+                 own cursor, and so it can never overlap the screen or the
+                 buttons no matter how the artwork is repositioned. -->
+            <div id="beeper-grip" title="Drag to move the pager"></div>
+
+            <div id="beeper-screen" role="application" aria-label="Beeper display">
+                <div class="lcd-scanline"></div>
+                <header class="lcd-header">
+                    <span id="lcd-signal">▮▮▮▮</span>
+                    <strong id="lcd-brand">RS BEEPER</strong>
+                    <span id="lcd-battery">BAT 100</span>
+                </header>
+                <div id="lcd-content"></div>
+                <nav id="lcd-tabs" aria-label="Beeper menu">
+                    <button data-tab="home">HOME</button>
+                    <button data-tab="messages">MSG</button>
+                    <button data-tab="codes">CODE</button>
+                    <button data-tab="identity">ID</button>
+                    <button data-tab="settings">SET</button>
+                </nav>
+            </div>
+
+            <button class="hardware hotspot-back" data-hw="back" aria-label="Back" title="Back / Home"></button>
+            <button class="hardware hotspot-left" data-hw="left" aria-label="Previous menu" title="Previous menu"></button>
+            <button class="hardware hotspot-right" data-hw="right" aria-label="Next menu" title="Next menu"></button>
+            <button class="hardware hotspot-select" data-hw="select" aria-label="Enter or select" title="Enter / Select"></button>
+            <button class="close-button" data-hw="close" aria-label="Close">×</button>
+        </section>
+    </main>
+    <script src="app.js"></script>
+</body>
+</html>
