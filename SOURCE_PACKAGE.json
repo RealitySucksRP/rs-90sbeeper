@@ -1,9 +1,9 @@
 {
   "archive": "rs-90sbeeper.zip",
-  "sha256": "87c9d6cf828d64c04b47b4e806acd763e83498b6a1c9e9ee253a8505997c6687",
+  "sha256": "2d04509e6615ff7a6646a03fa53c01651707b45ed02ab85afc64b4d771de3a12",
   "resourceFolder": "rs-90sbeeper",
-  "manifestVersion": "cerulean",
+  "manifestVersion": "0.4.6",
   "importedOn": "2026-10-14",
-  "sourceFiles": 35,
+  "sourceFiles": 29,
   "tebex": "https://reality-sucks-rp-webstore.tebex.io/package/7738385"
 }
